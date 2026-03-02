@@ -31,8 +31,6 @@ Please note that default end-to-end optimization may not suit complex models.
 # First, we prepare the model and input information. We use a pre-trained ResNet-18 model from
 # PyTorch.
 
-print("START")
-print("Before export")
 import os
 import numpy as np
 import torch
@@ -41,7 +39,6 @@ from torchvision.models.resnet import ResNet18_Weights, resnet18
 
 torch_model = resnet18(weights=ResNet18_Weights.DEFAULT).eval()
 
-print("After export")
 ######################################################################
 # Review Overall Flow
 # -------------------
@@ -96,7 +93,7 @@ mod.show()
 #
 
 TOTAL_TRIALS = 1000  # Change to 20000 for better performance if needed
-target = tvm.target.Target("cuda -arch=sm_89") # Change to your target device
+target = tvm.target.Target("nvidia/geforce-rtx-4090") # Change to your target device
 work_dir = "tuning_logs"
 
 # Skip running in CI environment

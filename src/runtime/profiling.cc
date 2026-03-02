@@ -36,6 +36,12 @@
 #include <map>
 #include <numeric>
 #include <thread>
+#include <nvml.h>
+#include <atomic>
+#include <thread>
+#include <vector>
+#include <mutex>
+
 
 namespace tvm {
 namespace runtime {
@@ -859,66 +865,116 @@ TVM_REGISTER_GLOBAL("runtime.profiling.ProfileFunction")
       }
     });
 
-PackedFunc WrapTimeEvaluator(PackedFunc pf, Device dev, int number, int repeat, int min_repeat_ms,
-                             int limit_zero_time_iterations, int cooldown_interval_ms,
-                             int repeats_to_cooldown, int cache_flush_bytes, PackedFunc f_preproc) {
+
+
+struct NVMLMetrics {
+  double avg_power_w = 0.0;
+};
+
+static NVMLMetrics g_last_metrics;
+static bool g_nvml_initialized = false;
+static nvmlDevice_t g_nvml_device;
+static std::mutex g_nvml_mutex;
+
+// ---------- NVML INIT (process-wide) ----------
+void InitNVMLOnce() {
+  std::lock_guard<std::mutex> lock(g_nvml_mutex);
+  if (!g_nvml_initialized) {
+    nvmlInit();
+    nvmlDeviceGetHandleByIndex(0, &g_nvml_device);
+    g_nvml_initialized = true;
+  }
+}
+
+
+
+PackedFunc WrapTimeEvaluator(
+    PackedFunc pf,
+    Device dev,
+    int number,
+    int repeat,
+    int min_repeat_ms,
+    int limit_zero_time_iterations,
+    int cooldown_interval_ms,
+    int repeats_to_cooldown,
+    int cache_flush_bytes,
+    PackedFunc f_preproc) {
+
   ICHECK(pf != nullptr);
 
-  if (static_cast<int>(dev.device_type) == static_cast<int>(kDLMicroDev)) {
-    auto get_micro_time_evaluator = runtime::Registry::Get("micro._GetMicroTimeEvaluator");
-    ICHECK(get_micro_time_evaluator != nullptr) << "micro backend not enabled";
-    return (*get_micro_time_evaluator)(pf, dev, number, repeat);
-  }
+  auto ftimer = [=](TVMArgs args, TVMRetValue* rv) mutable {
 
-  auto ftimer = [pf, dev, number, repeat, min_repeat_ms, limit_zero_time_iterations,
-                 cooldown_interval_ms, repeats_to_cooldown, cache_flush_bytes,
-                 f_preproc](TVMArgs args, TVMRetValue* rv) mutable {
     TVMRetValue temp;
     std::ostringstream os;
-    // skip first time call, to activate lazy compilation components.
-    pf.CallPacked(args, &temp);
 
-    // allocate two large arrays to flush L2 cache
-    NDArray arr1, arr2;
-    if (cache_flush_bytes > 0) {
-      arr1 = NDArray::Empty({cache_flush_bytes / 4}, {kDLInt, 32, 1}, dev);
-      arr2 = NDArray::Empty({cache_flush_bytes / 4}, {kDLInt, 32, 1}, dev);
-    }
+    // warmup
+    pf.CallPacked(args, &temp);
 
     DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
 
+    InitNVMLOnce();
+
     for (int i = 0; i < repeat; ++i) {
+
       if (f_preproc != nullptr) {
         f_preproc.CallPacked(args, &temp);
       }
-      double duration_ms = 0.0;
-      int absolute_zero_times = 0;
-      do {
-        if (duration_ms > 0.0) {
-          const double golden_ratio = 1.618;
-          number = static_cast<int>(
-              std::max((min_repeat_ms / (duration_ms / number) + 1), number * golden_ratio));
-        }
-        if (cache_flush_bytes > 0) {
-          arr1.CopyFrom(arr2);
-        }
-        DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
-        // start timing
-        Timer t = Timer::Start(dev);
-        for (int j = 0; j < number; ++j) {
-          pf.CallPacked(args, &temp);
-        }
-        t->Stop();
-        int64_t t_nanos = t->SyncAndGetElapsedNanos();
-        if (t_nanos == 0) absolute_zero_times++;
-        duration_ms = t_nanos / 1e6;
-      } while (duration_ms < min_repeat_ms && absolute_zero_times < limit_zero_time_iterations);
 
+      DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
+
+      std::atomic<bool> sampling{true};
+      std::vector<double> power_samples;
+      power_samples.reserve(1000);
+
+      // -------------------------
+      // sampling thread
+      // -------------------------
+      std::thread sampler([&]() {
+        while (sampling.load(std::memory_order_relaxed)) {
+          unsigned int power_mw = 0;
+          if (nvmlDeviceGetPowerUsage(g_nvml_device, &power_mw) == NVML_SUCCESS) {
+            power_samples.push_back(power_mw / 1000.0);
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+      });
+
+      // -------------------------
+      // timing start
+      // -------------------------
+      Timer t = Timer::Start(dev);
+
+      for (int j = 0; j < number; ++j) {
+        pf.CallPacked(args, &temp);
+      }
+
+      t->Stop();
+      int64_t t_nanos = t->SyncAndGetElapsedNanos();
+
+      // -------------------------
+      // sampling stop
+      // -------------------------
+      sampling.store(false, std::memory_order_relaxed);
+      sampler.join();
+
+      double duration_ms = t_nanos / 1e6;
       double speed = duration_ms / 1e3 / number;
+
       os.write(reinterpret_cast<char*>(&speed), sizeof(speed));
 
-      if (cooldown_interval_ms > 0 && (i % repeats_to_cooldown) == 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(cooldown_interval_ms));
+      // -------- average power --------
+      double avg_power = 0.0;
+      if (!power_samples.empty()) {
+        for (double p : power_samples) avg_power += p;
+        avg_power /= power_samples.size();
+      }
+
+      g_last_metrics.avg_power_w = avg_power;
+
+      if (cooldown_interval_ms > 0 &&
+          (i % repeats_to_cooldown) == 0) {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(cooldown_interval_ms));
       }
     }
 
@@ -926,11 +982,16 @@ PackedFunc WrapTimeEvaluator(PackedFunc pf, Device dev, int number, int repeat, 
     TVMByteArray arr;
     arr.size = blob.length();
     arr.data = blob.data();
-    // return the time.
     *rv = arr;
   };
+
   return PackedFunc(ftimer);
 }
+
+TVM_REGISTER_GLOBAL("runtime.profiling.get_last_nvml_metrics")
+.set_body([](TVMArgs args, TVMRetValue* rv) {
+  *rv = g_last_metrics.avg_power_w;
+});
 
 TVM_REGISTER_GLOBAL("runtime.profiling.Report")
     .set_body_typed([](Array<Map<String, ObjectRef>> calls,

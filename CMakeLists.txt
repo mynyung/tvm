@@ -634,6 +634,12 @@ else()
   )
 endif()
 
+target_link_libraries(
+  tvm
+  PRIVATE
+  /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
+)
+
 target_include_directories(tvm PUBLIC "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
 set_property(TARGET tvm APPEND PROPERTY LINK_OPTIONS "${TVM_NO_UNDEFINED_SYMBOLS}")
 set_property(TARGET tvm APPEND PROPERTY LINK_OPTIONS "${TVM_VISIBILITY_FLAG}")
@@ -655,6 +661,14 @@ else()
     $<TARGET_OBJECTS:tvm_libinfo_objs>
     ${TVM_RUNTIME_EXT_OBJS}
   )
+
+  target_link_libraries(
+      tvm_runtime
+      PRIVATE
+      /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1
+  )
+
+
   set_property(TARGET tvm_runtime APPEND PROPERTY LINK_OPTIONS "${TVM_NO_UNDEFINED_SYMBOLS}")
 endif()
 
