@@ -909,10 +909,12 @@ PackedFunc WrapTimeEvaluator(
 
     // warmup
     pf.CallPacked(args, &temp);
-
     DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
 
     InitNVMLOnce();
+
+    double total_power = 0.0;
+    int power_repeat_count = 0;
 
     for (int i = 0; i < repeat; ++i) {
 
@@ -935,7 +937,7 @@ PackedFunc WrapTimeEvaluator(
           if (nvmlDeviceGetPowerUsage(g_nvml_device, &power_mw) == NVML_SUCCESS) {
             power_samples.push_back(power_mw / 1000.0);
           }
-          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
       });
 
@@ -962,20 +964,28 @@ PackedFunc WrapTimeEvaluator(
 
       os.write(reinterpret_cast<char*>(&speed), sizeof(speed));
 
-      // -------- average power --------
-      double avg_power = 0.0;
+      // -------- average power for this repeat --------
       if (!power_samples.empty()) {
+        double avg_power = 0.0;
         for (double p : power_samples) avg_power += p;
         avg_power /= power_samples.size();
-      }
 
-      g_last_metrics.avg_power_w = avg_power;
+        total_power += avg_power;
+        power_repeat_count += 1;
+      }
 
       if (cooldown_interval_ms > 0 &&
           (i % repeats_to_cooldown) == 0) {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(cooldown_interval_ms));
       }
+    }
+
+    // -------- average power across repeats --------
+    if (power_repeat_count > 0) {
+      g_last_metrics.avg_power_w = total_power / power_repeat_count;
+    } else {
+      g_last_metrics.avg_power_w = 0.0;
     }
 
     std::string blob = os.str();

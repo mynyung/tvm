@@ -91,8 +91,8 @@ with open(OUT_PATH, "w", newline="") as f:
                 "main",
                 dev,
                 number=1,
-                repeat=3,
-                min_repeat_ms=50,
+                repeat=5,
+                min_repeat_ms=300,
             )
 
             timing = ftimer(*args)
