@@ -871,6 +871,12 @@ struct NVMLMetrics {
   double avg_power_w = 0.0;
 };
 
+struct NVMLMetrics {
+  double avg_power_w = 0.0;
+};
+
+#ifdef TVM_ENABLE_NVML_POWER
+
 static NVMLMetrics g_last_metrics;
 static bool g_nvml_initialized = false;
 static nvmlDevice_t g_nvml_device;
@@ -886,6 +892,7 @@ void InitNVMLOnce() {
   }
 }
 
+#endif
 
 
 PackedFunc WrapTimeEvaluator(
@@ -911,10 +918,12 @@ PackedFunc WrapTimeEvaluator(
     pf.CallPacked(args, &temp);
     DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
 
+#ifdef TVM_ENABLE_NVML_POWER
     InitNVMLOnce();
 
     double total_power = 0.0;
     int power_repeat_count = 0;
+#endif
 
     for (int i = 0; i < repeat; ++i) {
 
@@ -924,6 +933,7 @@ PackedFunc WrapTimeEvaluator(
 
       DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
 
+#ifdef TVM_ENABLE_NVML_POWER
       std::atomic<bool> sampling{true};
       std::vector<double> power_samples;
       power_samples.reserve(1000);
@@ -940,6 +950,7 @@ PackedFunc WrapTimeEvaluator(
           std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
       });
+#endif
 
       // -------------------------
       // timing start
@@ -953,17 +964,20 @@ PackedFunc WrapTimeEvaluator(
       t->Stop();
       int64_t t_nanos = t->SyncAndGetElapsedNanos();
 
+#ifdef TVM_ENABLE_NVML_POWER
       // -------------------------
       // sampling stop
       // -------------------------
       sampling.store(false, std::memory_order_relaxed);
       sampler.join();
+#endif
 
       double duration_ms = t_nanos / 1e6;
       double speed = duration_ms / 1e3 / number;
 
       os.write(reinterpret_cast<char*>(&speed), sizeof(speed));
 
+#ifdef TVM_ENABLE_NVML_POWER
       // -------- average power for this repeat --------
       if (!power_samples.empty()) {
         double avg_power = 0.0;
@@ -973,6 +987,7 @@ PackedFunc WrapTimeEvaluator(
         total_power += avg_power;
         power_repeat_count += 1;
       }
+#endif
 
       if (cooldown_interval_ms > 0 &&
           (i % repeats_to_cooldown) == 0) {
@@ -981,12 +996,14 @@ PackedFunc WrapTimeEvaluator(
       }
     }
 
+#ifdef TVM_ENABLE_NVML_POWER
     // -------- average power across repeats --------
     if (power_repeat_count > 0) {
       g_last_metrics.avg_power_w = total_power / power_repeat_count;
     } else {
       g_last_metrics.avg_power_w = 0.0;
     }
+#endif
 
     std::string blob = os.str();
     TVMByteArray arr;
