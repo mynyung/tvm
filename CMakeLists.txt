@@ -26,6 +26,13 @@ endif()
 # You can create a config.cmake at build folder
 # and add set(OPTION VALUE) to override these build options.
 # Alernatively, use cmake -DOPTION=VALUE through command-line.
+
+option(TVM_ENABLE_NVML_POWER "Enable NVML power sampling" OFF)
+
+if(TVM_ENABLE_NVML_POWER)
+  add_definitions(-DTVM_ENABLE_NVML_POWER)
+endif()
+
 tvm_option(USE_CUDA "Build with CUDA" OFF)
 tvm_option(USE_NCCL "Build with NCCL" OFF)
 tvm_option(USE_MSCCL "Build with MSCCL" OFF)

@@ -867,15 +867,13 @@ TVM_REGISTER_GLOBAL("runtime.profiling.ProfileFunction")
 
 
 
-struct NVMLMetrics {
-  double avg_power_w = 0.0;
-};
-
-struct NVMLMetrics {
-  double avg_power_w = 0.0;
-};
 
 #ifdef TVM_ENABLE_NVML_POWER
+
+struct NVMLMetrics {
+  double avg_power_w = 0.0;
+};
+
 
 static NVMLMetrics g_last_metrics;
 static bool g_nvml_initialized = false;
@@ -883,7 +881,7 @@ static nvmlDevice_t g_nvml_device;
 static std::mutex g_nvml_mutex;
 
 // ---------- NVML INIT (process-wide) ----------
-void InitNVMLOnce() {
+static void InitNVMLOnce() {
   std::lock_guard<std::mutex> lock(g_nvml_mutex);
   if (!g_nvml_initialized) {
     nvmlInit();
@@ -1015,10 +1013,12 @@ PackedFunc WrapTimeEvaluator(
   return PackedFunc(ftimer);
 }
 
+#ifdef TVM_ENABLE_NVML_POWER
 TVM_REGISTER_GLOBAL("runtime.profiling.get_last_nvml_metrics")
 .set_body([](TVMArgs args, TVMRetValue* rv) {
   *rv = g_last_metrics.avg_power_w;
 });
+#endif
 
 TVM_REGISTER_GLOBAL("runtime.profiling.Report")
     .set_body_typed([](Array<Map<String, ObjectRef>> calls,
