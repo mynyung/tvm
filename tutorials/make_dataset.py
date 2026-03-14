@@ -10,8 +10,21 @@ import hashlib
 # ===============================
 
 dev = tvm.cuda(0)
-N = 100
-OUT_PATH = "eyas_gpu_dataset.csv"
+
+db = ms.database.JSONDatabase(work_dir="tuning_logs")
+all_recs = db.get_all_tuning_records()
+print(len(all_recs))
+N = len(all_recs)
+OUT_PATH = "eyas_gpu4090_dataset_resnet50.csv"
+
+tensor_cache = {}
+def get_cached_nd(shape, dtype):
+    key = (tuple(shape), str(dtype))
+    if key not in tensor_cache:
+        arr = np.random.rand(*[int(s) for s in shape]).astype(dtype)
+        tensor_cache[key] = tvm.nd.array(arr, device=dev)
+    return tensor_cache[key]
+
 
 def as_float_metric(x):
     if hasattr(x, "ratio"):
@@ -31,8 +44,6 @@ def trace_fingerprint(trace):
 # Load Tuning Records
 # ===============================
 
-db = ms.database.JSONDatabase(work_dir="tuning_logs")
-all_recs = db.get_all_tuning_records()
 actual_N = min(N, len(all_recs))
 recs = [all_recs[i] for i in range(actual_N)]
 
@@ -51,6 +62,7 @@ with open(OUT_PATH, "w", newline="") as f:
         "i",
         "workload_hash",
         "trace_hash",
+        "freq_mhz",
         "n_stores",
         "lat_mean_ms",
         "avg_power_w",
@@ -85,12 +97,12 @@ with open(OUT_PATH, "w", newline="") as f:
 
             # Build & run
             rt_mod = tvm.build(sch.mod, target=target)
-            args = [make_nd(t.shape, t.dtype) for t in r.args_info]
+            args = [get_cached_nd(t.shape, t.dtype) for t in r.args_info]
 
             ftimer = rt_mod.time_evaluator(
                 "main",
                 dev,
-                number=1,
+                number=100,
                 repeat=5,
                 min_repeat_ms=300,
             )
@@ -109,6 +121,7 @@ with open(OUT_PATH, "w", newline="") as f:
                 i,
                 workload_hash,
                 trace_hash,
+                885,   # frequency column
                 int(feat.shape[0]),
                 float(timing.mean) * 1e3,
                 avg_power,

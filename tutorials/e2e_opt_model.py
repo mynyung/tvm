@@ -35,9 +35,12 @@ import os
 import numpy as np
 import torch
 from torch.export import export
-from torchvision.models.resnet import ResNet18_Weights, resnet18
+# from torchvision.models.resnet import ResNet18_Weights, resnet18
 
-torch_model = resnet18(weights=ResNet18_Weights.DEFAULT).eval()
+# torch_model = resnet18(weights=ResNet18_Weights.DEFAULT).eval()
+
+from torchvision.models.resnet import ResNet50_Weights, resnet50
+torch_model = resnet50(weights=ResNet50_Weights.DEFAULT).eval()
 
 ######################################################################
 # Review Overall Flow
@@ -92,7 +95,7 @@ mod.show()
 # apply the database to the model to get the best performance.
 #
 
-TOTAL_TRIALS = 1000  # Change to 20000 for better performance if needed
+TOTAL_TRIALS = 30000  # Change to 20000 for better performance if needed
 target = tvm.target.Target("nvidia/geforce-rtx-4090") # Change to your target device
 work_dir = "tuning_logs"
 
