@@ -4,77 +4,135 @@ import tvm
 from tvm import tir
 from tvm import meta_schedule as ms
 import hashlib
-import random
 import os
 import argparse
 import pandas as pd
+import random
 
 # ===============================
-# Argument
+# Arguments
 # ===============================
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--freq", type=int, required=True)
+parser.add_argument("--model", type=str, required=True)
+parser.add_argument("--max_samples", type=int, default=3000)
 args = parser.parse_args()
 
 FREQ_MHZ = args.freq
+MODEL = args.model
+MAX_SAMPLES = args.max_samples
 
 # ===============================
-# Basic Setup
+# Paths
+# ===============================
+
+TUNING_LOG_DIR = f"tuning_logs_{MODEL}"
+OUT_PATH = f"eyas_gpu4090_dataset_{MODEL}.csv"
+SCHEDULE_CACHE = f"schedule_subset_{MODEL}.txt"
+
+# ===============================
+# Device
 # ===============================
 
 dev = tvm.cuda(0)
 
-db = ms.database.JSONDatabase(work_dir="tuning_logs")
+# ===============================
+# Load tuning records
+# ===============================
+
+db = ms.database.JSONDatabase(work_dir=TUNING_LOG_DIR)
 all_recs = list(db.get_all_tuning_records())
 
 print("Total tuning records:", len(all_recs))
 
-MAX_SAMPLES = 3000
-OUT_PATH = "eyas_gpu4090_dataset_resnet50.csv"
-
-tensor_cache = {}
-
-def get_cached_nd(shape, dtype):
-    key = (tuple(shape), str(dtype))
-    if key not in tensor_cache:
-        arr = np.random.rand(*[int(s) for s in shape]).astype(dtype)
-        tensor_cache[key] = tvm.nd.array(arr, device=dev)
-    return tensor_cache[key]
-
-def trace_fingerprint(trace):
-    obj = trace.as_python() if hasattr(trace, "as_python") else repr(trace)
-    s = obj if isinstance(obj, str) else "\n".join(str(x) for x in obj)
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()
-
 # ===============================
-# Load Records
+# Fix schedule subset (important)
 # ===============================
 
-actual_N = min(MAX_SAMPLES, len(all_recs))
-recs = random.sample(all_recs, actual_N)
+if os.path.exists(SCHEDULE_CACHE):
 
-print(f"[INFO] Sampling {actual_N} records")
+    with open(SCHEDULE_CACHE) as f:
+        idxs = [int(x.strip()) for x in f]
+
+    recs = [all_recs[i] for i in idxs]
+
+    print("Loaded fixed schedule subset")
+
+else:
+
+    actual_N = min(MAX_SAMPLES, len(all_recs))
+
+    idxs = random.sample(range(len(all_recs)), actual_N)
+
+    with open(SCHEDULE_CACHE, "w") as f:
+        for i in idxs:
+            f.write(f"{i}\n")
+
+    recs = [all_recs[i] for i in idxs]
+
+    print("Created schedule subset")
+
+actual_N = len(recs)
+
+print("Schedule count:", actual_N)
+print("Frequency:", FREQ_MHZ)
+
+# ===============================
+# Feature extractor
+# ===============================
 
 extractor = ms.feature_extractor.PerStoreFeature()
 
 # ===============================
-# CSV Handling
+# Tensor cache
+# ===============================
+
+tensor_cache = {}
+
+def get_cached_nd(shape, dtype):
+
+    key = (tuple(shape), str(dtype))
+
+    if key not in tensor_cache:
+
+        arr = np.random.rand(*[int(s) for s in shape]).astype(dtype)
+
+        tensor_cache[key] = tvm.nd.array(arr, device=dev)
+
+    return tensor_cache[key]
+
+# ===============================
+# Trace fingerprint
+# ===============================
+
+def trace_fingerprint(trace):
+
+    obj = trace.as_python() if hasattr(trace, "as_python") else repr(trace)
+
+    s = obj if isinstance(obj, str) else "\n".join(str(x) for x in obj)
+
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+# ===============================
+# CSV setup
 # ===============================
 
 write_header = not os.path.exists(OUT_PATH)
 
 if os.path.exists(OUT_PATH):
+
     df = pd.read_csv(OUT_PATH)
     start_i = len(df)
+
 else:
+
     start_i = 0
 
 print("Start index:", start_i)
-print("Frequency:", FREQ_MHZ)
 
 # ===============================
-# Dataset Generation
+# Dataset generation
 # ===============================
 
 with open(OUT_PATH, "a", newline="") as f:
@@ -85,6 +143,7 @@ with open(OUT_PATH, "a", newline="") as f:
 
         header = [
             "i",
+            "model",
             "workload_hash",
             "trace_hash",
             "freq_mhz",
@@ -116,15 +175,14 @@ with open(OUT_PATH, "a", newline="") as f:
             ctx = ms.TuneContext(
                 mod=mod,
                 target=target,
-                task_name=f"rec_{i}",
+                task_name=f"{MODEL}_{i}",
             )
 
             # Feature extraction
             (feat_nd,) = extractor.extract_from(ctx, candidates=[cand])
-
             feat = feat_nd.numpy()
 
-            # Eyas aggregation (164 -> 656)
+            # Eyas aggregation
             agg = np.concatenate(
                 [
                     feat.mean(0),
@@ -139,18 +197,18 @@ with open(OUT_PATH, "a", newline="") as f:
 
             args = [get_cached_nd(t.shape, t.dtype) for t in r.args_info]
 
-            # Run timing
+            # Latency measurement
             ftimer = rt_mod.time_evaluator(
                 "main",
                 dev,
-                number=100,
+                number=30,
                 repeat=5,
                 min_repeat_ms=300,
             )
 
             timing = ftimer(*args)
 
-            # Power measurement
+            # NVML power
             avg_power = float(
                 tvm.get_global_func(
                     "runtime.profiling.get_last_nvml_metrics"
@@ -159,6 +217,7 @@ with open(OUT_PATH, "a", newline="") as f:
 
             row = [
                 start_i + i,
+                MODEL,
                 workload_hash,
                 trace_hash,
                 FREQ_MHZ,

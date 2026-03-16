@@ -4,6 +4,7 @@ import tvm
 from tvm import tir
 from tvm import meta_schedule as ms
 import hashlib
+import random
 
 # ===============================
 # Basic Setup
@@ -12,9 +13,12 @@ import hashlib
 dev = tvm.cuda(0)
 
 db = ms.database.JSONDatabase(work_dir="tuning_logs")
-all_recs = db.get_all_tuning_records()
+all_recs = list(db.get_all_tuning_records())
 print(len(all_recs))
 N = len(all_recs)
+
+MAX_SAMPLES = 3000
+
 OUT_PATH = "eyas_gpu4090_dataset_resnet50.csv"
 
 tensor_cache = {}
@@ -44,8 +48,8 @@ def trace_fingerprint(trace):
 # Load Tuning Records
 # ===============================
 
-actual_N = min(N, len(all_recs))
-recs = [all_recs[i] for i in range(actual_N)]
+actual_N = min(MAX_SAMPLES, len(all_recs))
+recs = random.sample(all_recs, actual_N)
 
 print(f"[INFO] Loaded {len(recs)} tuning records.")
 
@@ -109,19 +113,18 @@ with open(OUT_PATH, "w", newline="") as f:
 
             timing = ftimer(*args)
 
-            # 🔥 Read NVML snapshot from C++ runtime
+            # NVML metrics
             nvml = tvm.get_global_func(
                 "runtime.profiling.get_last_nvml_metrics"
             )()
 
-            # avg_power = as_float_metric(nvml["avg_power_w"])
             avg_power = float(tvm.get_global_func("runtime.profiling.get_last_nvml_metrics")())
 
             row = [
                 i,
                 workload_hash,
                 trace_hash,
-                885,   # frequency column
+                885,
                 int(feat.shape[0]),
                 float(timing.mean) * 1e3,
                 avg_power,
