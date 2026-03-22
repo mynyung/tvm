@@ -897,6 +897,8 @@ static void InitNVMLOnce() {
 }
 #endif
 
+
+
 PackedFunc WrapTimeEvaluator(
     PackedFunc pf, Device dev, int number, int repeat, int min_repeat_ms,
     int limit_zero_time_iterations, int cooldown_interval_ms,
@@ -908,19 +910,22 @@ PackedFunc WrapTimeEvaluator(
         TVMRetValue temp;
         std::ostringstream os;
 
-        // 0. 초기 1회 실행 (라이브러리 로딩 오버헤드 제거)
+        // 0. 초기 1회 실행 (커널 실행 시간 추정)
+        auto t_est_start = std::chrono::steady_clock::now();
         pf.CallPacked(args, &temp);
         DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
+        auto t_est_end = std::chrono::steady_clock::now();
+        double est_lat_ms = std::chrono::duration_cast<std::chrono::microseconds>(t_est_end - t_est_start).count() / 1000.0;
 
 #ifdef TVM_ENABLE_NVML_POWER
         InitNVMLOnce();
 
-        // --- [준비] 전력 샘플링 스레드 즉시 시작 (모든 구간 포함) ---
         std::atomic<bool> sampling{true};
-        std::vector<double> power_buffer; // 모든 전력 데이터가 쌓이는 곳
+        std::vector<double> power_buffer; 
         std::mutex power_mtx;
-        power_buffer.reserve(10000);
+        power_buffer.reserve(50000); 
 
+        // 5ms 주기로 전력 샘플링을 수행하는 백그라운드 스레드
         std::thread sampler([&]() {
             while (sampling.load(std::memory_order_relaxed)) {
                 unsigned int power_mw = 0;
@@ -932,77 +937,97 @@ PackedFunc WrapTimeEvaluator(
             }
         });
 
-        // --- [STEP 1] 전역 1회 Warmup (전력 안정화) ---
-        std::vector<WarmupLog> warmup_logs;
+        // --- [STEP 1] Accurate Reactive Warmup (100-Sample Window & 0.5% Stability Threshold) ---
+        {
+            std::lock_guard<std::mutex> lock(power_mtx);
+            power_buffer.clear();
+        }
+
         auto warmup_start_time = std::chrono::steady_clock::now();
+        double final_warmup_power = 0.0;
+        double max_power_seen = 0.0;
+        bool stabilized = false;
+        int total_kernel_calls = 0;
+        int consecutive_stable_count = 0;
         
-        int stable_count = 0;
-        int step_count = 0;
-        const double stability_threshold = 0.10; // 10% 오차 허용
-        const int required_stable_steps = 3; 
+        const double stability_threshold = 0.01; // 1% 오차 범위
+        const int window_size = 100;              //  40개 -> 100개 샘플 (약 500ms 구간) 감시로 확장
+        const int required_stable_steps = 10;     // 10회 연속 안정 시 탈출
+        const int max_warmup_ms = 30000;          // 윈도우 확장에 따른 최대 시간 15초로 상향
+
+        // 체크 한 번당 약 25ms 분량의 부하를 주어 반응성 유지
+        int warmup_batch = (est_lat_ms > 0) ? std::max(1, (int)(25.0 / est_lat_ms)) : 5;
 
         while (true) {
-            step_count++;
-            // GPU를 바쁘게 유지하기 위해 'number' 만큼 커널을 묶어서 실행
-            // 이렇게 해야 5ms 주기의 Sampler가 '실행 중 전력'을 잡을 확률이 높음
-            for (int k = 0; k < number; ++k) {
+            for (int k = 0; k < warmup_batch; ++k) {
                 pf.CallPacked(args, &temp);
+                total_kernel_calls++;
             }
             DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
 
-            double current_val = 0.0;
-            double recent_5_avg = 0.0;
-            bool can_check = false;
-
             {
                 std::lock_guard<std::mutex> lock(power_mtx);
-                if (power_buffer.size() >= 6) {
-                    current_val = power_buffer.back(); // 방금 커널 실행 중/직후 찍힌 값
+                // 윈도우 크기(100)가 확보되었을 때부터 판단 시작
+                if (power_buffer.size() >= (size_t)(window_size + 1)) {
+                    double current_val = power_buffer.back();
+                    final_warmup_power = current_val;
                     
-                    // 직전 5개 샘플 평균 (비교군)
-                    for (size_t idx = power_buffer.size() - 6; idx < power_buffer.size() - 1; ++idx) {
-                        recent_5_avg += power_buffer[idx];
+                    // 웜업 전체 구간 중 관측된 최댓값 업데이트
+                    if (current_val > max_power_seen) max_power_seen = current_val;
+
+                    // 최근 100개 샘플의 이동 평균 계산
+                    double sum_window = 0;
+                    for (size_t i = power_buffer.size() - (window_size + 1); i < power_buffer.size() - 1; ++i) {
+                        sum_window += power_buffer[i];
                     }
-                    recent_5_avg /= 5.0;
-                    can_check = true;
+                    double avg_window = sum_window / static_cast<double>(window_size);
+                    double diff_ratio = (current_val - avg_window) / avg_window;
+
+                    // [안정화 조건]
+                    // 1. 현재 값이 100개 샘플 평균과 0.5% 이내여야 함 (is_flat)
+                    // 2. 현재 값이 이전 구간보다 눈에 띄게 높지 않음 (상승 억제)
+                    // 3. 현재 값이 지금까지 관측된 최댓값의 99% 이상이어야 함 (피크 도달 확인)
+                    bool is_flat = (std::abs(diff_ratio) < stability_threshold && diff_ratio <= 0.001);
+                    bool is_at_peak = (current_val >= max_power_seen * 0.99);
+
+                    if (is_flat && is_at_peak) {
+                        consecutive_stable_count++;
+                    } else {
+                        consecutive_stable_count = 0;
+                    }
+
+                    if (consecutive_stable_count >= required_stable_steps) {
+                        stabilized = true;
+                        break; 
+                    }
                 }
             }
 
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            auto elapsed_now = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - warmup_start_time).count();
 
-            if (can_check) {
-                bool is_currently_stable = std::abs(current_val - recent_5_avg) < (recent_5_avg * stability_threshold);
-                if (is_currently_stable) stable_count++;
-                else stable_count = 0;
-
-                warmup_logs.push_back({step_count, current_val, (long long)elapsed, (stable_count >= required_stable_steps)});
-            }
-
-            if (stable_count >= required_stable_steps || elapsed > 3000) break;
-            // 루프 사이의 아주 짧은 대기 (Sampler가 일할 시간 확보)
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            if (elapsed_now > max_warmup_ms) break;
         }
+
+        auto total_warmup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - warmup_start_time).count();
 
         // 웜업 로그 기록
         std::ofstream csv_file("/home/hyunjae/tvm/tutorials/warmup_log.csv", std::ios::app);
         if (csv_file.is_open()) {
-            for (const auto& log : warmup_logs) {
-                csv_file << log.step << "," << log.power << "," << log.elapsed_ms << "," << log.is_stable << "\n";
-            }
+            csv_file << final_warmup_power << "," << total_warmup_ms << "," << total_kernel_calls << "," << stabilized << "\n";
             csv_file.close();
         }
 
-        // 본 측정을 위해 웜업 동안 쌓인 데이터 초기화 (선택 사항: 웜업 이후의 순수 데이터만 보려면)
+        // 본 측정 구간의 순수 전력 데이터 수집을 위해 버퍼 초기화
         {
             std::lock_guard<std::mutex> lock(power_mtx);
             power_buffer.clear();
         }
 #endif
 
-        // --- [STEP 2] 본 측정: Repeat 루프 (Latency 측정) ---
+        // --- [STEP 2] 본 측정 (Latency 측정) ---
         const double golden_ratio = 1.61803398875;
-
         for (int i = 0; i < repeat; ++i) {
             if (f_preproc != nullptr) f_preproc.CallPacked(args, &temp);
             DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
@@ -1031,7 +1056,7 @@ PackedFunc WrapTimeEvaluator(
         }
 
 #ifdef TVM_ENABLE_NVML_POWER
-        // --- [STEP 3] 측정 종료 및 전력 합산 ---
+        // --- [STEP 3] 최종 전력 합산 및 정리 ---
         sampling.store(false);
         if (sampler.joinable()) sampler.join();
 
@@ -1046,16 +1071,12 @@ PackedFunc WrapTimeEvaluator(
         }
 #endif
 
-        // --- [STEP 4] 모든 측정 완료 후 Cooldown (휴식) ---
         if (cooldown_interval_ms > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(cooldown_interval_ms));
         }
 
-        // TVM 결과 반환
         std::string blob = os.str();
-        TVMByteArray arr;
-        arr.size = blob.length();
-        arr.data = blob.data();
+        TVMByteArray arr{blob.data(), blob.length()};
         *rv = arr;
     };
 
