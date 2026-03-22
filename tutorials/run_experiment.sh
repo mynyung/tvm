@@ -12,10 +12,10 @@ export CUDA_VISIBLE_DEVICES=0
 
 GPU_ID=0
 
-MODELS=(gpt2 densenet169 mobilenetv3)
+MODELS=(densenet169 mobilenetv3)
 FREQS=(885 1410 1710 2010 2520)
 
-cd ~/tvm/build
+cd ~/tvm/build 
 cmake .. -DTVM_ENABLE_NVML_POWER=OFF
 make -j$(nproc)
 cd ~/tvm/tutorials
@@ -50,7 +50,7 @@ sudo nvidia-smi -i $GPU_ID -pm 1
 
 for MODEL in "${MODELS[@]}"
 do
-    echo "===================================="
+    echo "====================================" 
     echo "START DATASET FOR MODEL: $MODEL"
     echo "===================================="
 

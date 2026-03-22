@@ -41,7 +41,8 @@
 #include <thread>
 #include <vector>
 #include <mutex>
-
+#include <fstream> // std::ofstream 사용을 위해
+#include <cmath>     // std::abs 사용을 위해
 
 namespace tvm {
 namespace runtime {
@@ -869,148 +870,196 @@ TVM_REGISTER_GLOBAL("runtime.profiling.ProfileFunction")
 
 
 #ifdef TVM_ENABLE_NVML_POWER
-
+// 1. 필요한 구조체 정의
 struct NVMLMetrics {
-  double avg_power_w = 0.0;
+    double avg_power_w = 0.0;
 };
 
+struct WarmupLog {
+    int step;
+    double power;
+    long long elapsed_ms;
+    bool is_stable;
+};
 
 static NVMLMetrics g_last_metrics;
 static bool g_nvml_initialized = false;
 static nvmlDevice_t g_nvml_device;
 static std::mutex g_nvml_mutex;
 
-// ---------- NVML INIT (process-wide) ----------
 static void InitNVMLOnce() {
-  std::lock_guard<std::mutex> lock(g_nvml_mutex);
-  if (!g_nvml_initialized) {
-    nvmlInit();
-    nvmlDeviceGetHandleByIndex(0, &g_nvml_device);
-    g_nvml_initialized = true;
-  }
+    std::lock_guard<std::mutex> lock(g_nvml_mutex);
+    if (!g_nvml_initialized) {
+        nvmlInit();
+        nvmlDeviceGetHandleByIndex(0, &g_nvml_device);
+        g_nvml_initialized = true;
+    }
 }
-
 #endif
-
 
 PackedFunc WrapTimeEvaluator(
-    PackedFunc pf,
-    Device dev,
-    int number,
-    int repeat,
-    int min_repeat_ms,
-    int limit_zero_time_iterations,
-    int cooldown_interval_ms,
-    int repeats_to_cooldown,
-    int cache_flush_bytes,
-    PackedFunc f_preproc) {
+    PackedFunc pf, Device dev, int number, int repeat, int min_repeat_ms,
+    int limit_zero_time_iterations, int cooldown_interval_ms,
+    int repeats_to_cooldown, int cache_flush_bytes, PackedFunc f_preproc) {
 
-  ICHECK(pf != nullptr);
+    ICHECK(pf != nullptr);
 
-  auto ftimer = [=](TVMArgs args, TVMRetValue* rv) mutable {
+    auto ftimer = [=](TVMArgs args, TVMRetValue* rv) mutable {
+        TVMRetValue temp;
+        std::ostringstream os;
 
-    TVMRetValue temp;
-    std::ostringstream os;
-
-    // warmup
-    pf.CallPacked(args, &temp);
-    DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
-
-#ifdef TVM_ENABLE_NVML_POWER
-    InitNVMLOnce();
-
-    double total_power = 0.0;
-    int power_repeat_count = 0;
-#endif
-
-    for (int i = 0; i < repeat; ++i) {
-
-      if (f_preproc != nullptr) {
-        f_preproc.CallPacked(args, &temp);
-      }
-
-      DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
-
-#ifdef TVM_ENABLE_NVML_POWER
-      std::atomic<bool> sampling{true};
-      std::vector<double> power_samples;
-      power_samples.reserve(1000);
-
-      // -------------------------
-      // sampling thread
-      // -------------------------
-      std::thread sampler([&]() {
-        while (sampling.load(std::memory_order_relaxed)) {
-          unsigned int power_mw = 0;
-          if (nvmlDeviceGetPowerUsage(g_nvml_device, &power_mw) == NVML_SUCCESS) {
-            power_samples.push_back(power_mw / 1000.0);
-          }
-          std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        }
-      });
-#endif
-
-      // -------------------------
-      // timing start
-      // -------------------------
-      Timer t = Timer::Start(dev);
-
-      for (int j = 0; j < number; ++j) {
+        // 0. 초기 1회 실행 (라이브러리 로딩 오버헤드 제거)
         pf.CallPacked(args, &temp);
-      }
-
-      t->Stop();
-      int64_t t_nanos = t->SyncAndGetElapsedNanos();
+        DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
 
 #ifdef TVM_ENABLE_NVML_POWER
-      // -------------------------
-      // sampling stop
-      // -------------------------
-      sampling.store(false, std::memory_order_relaxed);
-      sampler.join();
+        InitNVMLOnce();
+
+        // --- [준비] 전력 샘플링 스레드 즉시 시작 (모든 구간 포함) ---
+        std::atomic<bool> sampling{true};
+        std::vector<double> power_buffer; // 모든 전력 데이터가 쌓이는 곳
+        std::mutex power_mtx;
+        power_buffer.reserve(10000);
+
+        std::thread sampler([&]() {
+            while (sampling.load(std::memory_order_relaxed)) {
+                unsigned int power_mw = 0;
+                if (nvmlDeviceGetPowerUsage(g_nvml_device, &power_mw) == NVML_SUCCESS) {
+                    std::lock_guard<std::mutex> lock(power_mtx);
+                    power_buffer.push_back(power_mw / 1000.0);
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+        });
+
+        // --- [STEP 1] 전역 1회 Warmup (전력 안정화) ---
+        std::vector<WarmupLog> warmup_logs;
+        auto warmup_start_time = std::chrono::steady_clock::now();
+        
+        int stable_count = 0;
+        int step_count = 0;
+        const double stability_threshold = 0.10; // 10% 오차 허용
+        const int required_stable_steps = 3; 
+
+        while (true) {
+            step_count++;
+            // GPU를 바쁘게 유지하기 위해 'number' 만큼 커널을 묶어서 실행
+            // 이렇게 해야 5ms 주기의 Sampler가 '실행 중 전력'을 잡을 확률이 높음
+            for (int k = 0; k < number; ++k) {
+                pf.CallPacked(args, &temp);
+            }
+            DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
+
+            double current_val = 0.0;
+            double recent_5_avg = 0.0;
+            bool can_check = false;
+
+            {
+                std::lock_guard<std::mutex> lock(power_mtx);
+                if (power_buffer.size() >= 6) {
+                    current_val = power_buffer.back(); // 방금 커널 실행 중/직후 찍힌 값
+                    
+                    // 직전 5개 샘플 평균 (비교군)
+                    for (size_t idx = power_buffer.size() - 6; idx < power_buffer.size() - 1; ++idx) {
+                        recent_5_avg += power_buffer[idx];
+                    }
+                    recent_5_avg /= 5.0;
+                    can_check = true;
+                }
+            }
+
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - warmup_start_time).count();
+
+            if (can_check) {
+                bool is_currently_stable = std::abs(current_val - recent_5_avg) < (recent_5_avg * stability_threshold);
+                if (is_currently_stable) stable_count++;
+                else stable_count = 0;
+
+                warmup_logs.push_back({step_count, current_val, (long long)elapsed, (stable_count >= required_stable_steps)});
+            }
+
+            if (stable_count >= required_stable_steps || elapsed > 3000) break;
+            // 루프 사이의 아주 짧은 대기 (Sampler가 일할 시간 확보)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+
+        // 웜업 로그 기록
+        std::ofstream csv_file("/home/hyunjae/tvm/tutorials/warmup_log.csv", std::ios::app);
+        if (csv_file.is_open()) {
+            for (const auto& log : warmup_logs) {
+                csv_file << log.step << "," << log.power << "," << log.elapsed_ms << "," << log.is_stable << "\n";
+            }
+            csv_file.close();
+        }
+
+        // 본 측정을 위해 웜업 동안 쌓인 데이터 초기화 (선택 사항: 웜업 이후의 순수 데이터만 보려면)
+        {
+            std::lock_guard<std::mutex> lock(power_mtx);
+            power_buffer.clear();
+        }
 #endif
 
-      double duration_ms = t_nanos / 1e6;
-      double speed = duration_ms / 1e3 / number;
+        // --- [STEP 2] 본 측정: Repeat 루프 (Latency 측정) ---
+        const double golden_ratio = 1.61803398875;
 
-      os.write(reinterpret_cast<char*>(&speed), sizeof(speed));
+        for (int i = 0; i < repeat; ++i) {
+            if (f_preproc != nullptr) f_preproc.CallPacked(args, &temp);
+            DeviceAPI::Get(dev)->StreamSync(dev, nullptr);
+
+            int actual_number = number;
+            Timer t;
+            double duration_ms = 0.0;
+
+            while (true) {
+                t = Timer::Start(dev);
+                for (int j = 0; j < actual_number; ++j) {
+                    pf.CallPacked(args, &temp);
+                }
+                t->Stop();
+                duration_ms = t->SyncAndGetElapsedNanos() / 1e6;
+
+                if (duration_ms >= static_cast<double>(min_repeat_ms)) break;
+
+                int next_number = static_cast<int>(std::ceil(actual_number * golden_ratio));
+                if (next_number <= actual_number) next_number = actual_number + 1;
+                actual_number = next_number;
+            }
+
+            double speed = (duration_ms / 1e3) / actual_number;
+            os.write(reinterpret_cast<char*>(&speed), sizeof(speed));
+        }
 
 #ifdef TVM_ENABLE_NVML_POWER
-      // -------- average power for this repeat --------
-      if (!power_samples.empty()) {
-        double avg_power = 0.0;
-        for (double p : power_samples) avg_power += p;
-        avg_power /= power_samples.size();
+        // --- [STEP 3] 측정 종료 및 전력 합산 ---
+        sampling.store(false);
+        if (sampler.joinable()) sampler.join();
 
-        total_power += avg_power;
-        power_repeat_count += 1;
-      }
+        {
+            std::lock_guard<std::mutex> lock(power_mtx);
+            if (!power_buffer.empty()) {
+                double total_sum = std::accumulate(power_buffer.begin(), power_buffer.end(), 0.0);
+                g_last_metrics.avg_power_w = total_sum / power_buffer.size();
+            } else {
+                g_last_metrics.avg_power_w = 0.0;
+            }
+        }
 #endif
 
-      if (cooldown_interval_ms > 0 &&
-          (i % repeats_to_cooldown) == 0) {
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(cooldown_interval_ms));
-      }
-    }
+        // --- [STEP 4] 모든 측정 완료 후 Cooldown (휴식) ---
+        if (cooldown_interval_ms > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(cooldown_interval_ms));
+        }
 
-#ifdef TVM_ENABLE_NVML_POWER
-    // -------- average power across repeats --------
-    if (power_repeat_count > 0) {
-      g_last_metrics.avg_power_w = total_power / power_repeat_count;
-    } else {
-      g_last_metrics.avg_power_w = 0.0;
-    }
-#endif
+        // TVM 결과 반환
+        std::string blob = os.str();
+        TVMByteArray arr;
+        arr.size = blob.length();
+        arr.data = blob.data();
+        *rv = arr;
+    };
 
-    std::string blob = os.str();
-    TVMByteArray arr;
-    arr.size = blob.length();
-    arr.data = blob.data();
-    *rv = arr;
-  };
-
-  return PackedFunc(ftimer);
+    return PackedFunc(ftimer);
 }
 
 #ifdef TVM_ENABLE_NVML_POWER

@@ -16,7 +16,7 @@ import random
 parser = argparse.ArgumentParser()
 parser.add_argument("--freq", type=int, required=True)
 parser.add_argument("--model", type=str, required=True)
-parser.add_argument("--max_samples", type=int, default=3000)
+parser.add_argument("--max_samples", type=int, default=100) #max power samples 개수. 8000정도가 좋을 듯.
 args = parser.parse_args()
 
 FREQ_MHZ = args.freq
@@ -201,9 +201,9 @@ with open(OUT_PATH, "a", newline="") as f:
             ftimer = rt_mod.time_evaluator(
                 "main",
                 dev,
-                number=30,
+                number=50,
                 repeat=5,
-                min_repeat_ms=300,
+                min_repeat_ms=1000,
             )
 
             timing = ftimer(*args)
