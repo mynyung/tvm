@@ -319,7 +319,7 @@ class Module(object):
         dev,
         number=10,
         repeat=1,
-        min_repeat_ms=0,
+        min_repeat_ms=0, #원래 0이었음.
         limit_zero_time_iterations=100,
         cooldown_interval_ms=0,
         repeats_to_cooldown=1,
