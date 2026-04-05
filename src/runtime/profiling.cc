@@ -867,8 +867,6 @@ TVM_REGISTER_GLOBAL("runtime.profiling.ProfileFunction")
     });
 
 
-
-
 #ifdef TVM_ENABLE_NVML_POWER
 // 1. 필요한 구조체 정의
 struct NVMLMetrics {
@@ -896,7 +894,6 @@ static void InitNVMLOnce() {
     }
 }
 #endif
-
 
 
 PackedFunc WrapTimeEvaluator(
@@ -1082,6 +1079,7 @@ PackedFunc WrapTimeEvaluator(
 
     return PackedFunc(ftimer);
 }
+
 
 #ifdef TVM_ENABLE_NVML_POWER
 TVM_REGISTER_GLOBAL("runtime.profiling.get_last_nvml_metrics")
