@@ -75,3 +75,7 @@ warmup log의 final power랑 terminal에 뜨는 건 본측정값과 비교해서
 시간 관계상 커널 크기에 따라 sliding window로직 달라지도록 조정함.
 
 
+#튜닝, 스케줄
+Tuning 스케줄 2만 개.
+Tutorials/schedule.txt 파일에 있는 스케줄로만 파워 측정 함.
+
