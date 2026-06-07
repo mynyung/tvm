@@ -38,7 +38,7 @@ TVM is licensed under the [Apache-2.0](LICENSE) license.
 
 profiling.cc는 전처리 옵션에 따라 빌드 방식이 달라짐.
 
-## 1. 튜닝할 때
+### 1. 튜닝할 때
 
 NVML 기반 파워 측정을 끄고 빌드함.
 
@@ -48,7 +48,7 @@ make -j$(nproc)
 이후 튜닝 스크립트 실행.
 python e2e_3.py
 
-## 2. 파워 측정할 때
+### 2. 파워 측정할 때
 
 NVML 기반 파워 측정을 켜고 빌드함.
 
