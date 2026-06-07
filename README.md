@@ -42,21 +42,28 @@ profiling.cc는 전처리 옵션에 따라 빌드 방식이 달라짐.
 
 NVML 기반 파워 측정을 끄고 빌드함.
 
+```bash
 cmake .. -DTVM_ENABLE_NVML_POWER=OFF
 make -j$(nproc)
+```
 
 이후 튜닝 스크립트 실행.
+```bash
 python e2e_3.py
+```
 
 ### 2. 파워 측정할 때
 
 NVML 기반 파워 측정을 켜고 빌드함.
-
+```bash
 cmake .. -DTVM_ENABLE_NVML_POWER=ON
 make -j$(nproc)
-
+```
 이후 파워 데이터셋 생성 실행.
+```bash
 python append_dataset.py
+```
+
 
 
 
