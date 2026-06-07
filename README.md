@@ -33,21 +33,38 @@ License
 -------
 TVM is licensed under the [Apache-2.0](LICENSE) license.
 
-Getting Started
----------------
-Check out the [TVM Documentation](https://tvm.apache.org/docs/) site for installation instructions, tutorials, examples, and more.
-The [Getting Started with TVM](https://tvm.apache.org/docs/tutorial/introduction.html) tutorial is a great
-place to start.
 
-Contribute to TVM
------------------
-TVM adopts apache committer model, we aim to create an open source project that is maintained and owned by the community.
-Check out the [Contributor Guide](https://tvm.apache.org/docs/contribute/).
+# Build, Execution Note
 
-Acknowledgement
----------------
-We learned a lot from the following projects when building TVM.
-- [Halide](https://github.com/halide/Halide): Part of TVM's TIR and arithmetic simplification module
-  originates from Halide. We also learned and adapted some part of lowering pipeline from Halide.
-- [Loopy](https://github.com/inducer/loopy): use of integer set analysis and its loop transformation primitives.
-- [Theano](https://github.com/Theano/Theano): the design inspiration of symbolic scan operator for recurrence.
+profiling.cc는 전처리 옵션에 따라 빌드 방식이 달라짐.
+
+## 1. 튜닝할 때
+
+NVML 기반 파워 측정을 끄고 빌드함.
+
+cmake .. -DTVM_ENABLE_NVML_POWER=OFF
+make -j$(nproc)
+
+이후 튜닝 스크립트 실행.
+python e2e_3.py
+
+## 2. 파워 측정할 때
+
+NVML 기반 파워 측정을 켜고 빌드함.
+
+cmake .. -DTVM_ENABLE_NVML_POWER=ON
+make -j$(nproc)
+
+이후 파워 데이터셋 생성 실행.
+python append_dataset.py
+
+
+
+# Warmup logic
+tutorials에 warmup log 생성됨. 
+
+warmup log의 final power랑 terminal에 뜨는 건 본측정값과 비교해서 같아질 떄까지 sliding window 사이즈 조정함.
+
+시간 관계상 커널 크기에 따라 sliding window로직 달라지도록 조정함.
+
+
